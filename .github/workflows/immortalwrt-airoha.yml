@@ -13,17 +13,20 @@ on:
         default: 'master-airoha'
         type: string
       device:
-        description: '机型（默认 all：每个机型各起一个 job 并行编，stock 变体只编 MD 与 MF）'
+        description: '机型（本 fork 固定 XG-040G-MD；上游的其它机型选项见下方注释，需要时自行放开）'
         required: true
-        default: 'all'
+        # 本 fork 只用于编自己的 XG-040G-MD：默认值固定成它、选项也只留它，
+        # 这样在 Actions 页面点 Run workflow 直接按绿按钮就是对的，不用在下拉框里挑。
+        # 想恢复上游那种「一次编全部机型」，把下面注释掉的选项放回来即可：
+        #   - all
+        #   - xg-040g-mf
+        #   - xg-040g-tf
+        #   - zn504xg-d
+        #   - hg5382a
+        default: 'xg-040g-md'
         type: choice
         options:
-          - all
           - xg-040g-md
-          - xg-040g-mf
-          - xg-040g-tf
-          - zn504xg-d
-          - hg5382a
       device_variant:
         description: '设备变体（ubi 推荐：作者魔改 U-Boot，带网页救砖；stock 保留原厂引导）'
         required: true
@@ -43,9 +46,17 @@ on:
           - 1G
           - 2G
       extra_packages:
-        description: '附加软件包（空格分隔；包名前加 - 表示移除。可用选包页生成）'
+        description: '附加软件包（空格分隔；包名前加 - 表示移除）。已按本机需求预填：MT7921AU STA 桥接 + 代理 + 修复包，通常不用改'
         required: false
-        default: ''
+        # 预填内容与理由见 packages/xg040g-wifi-defaults/README.md，要点：
+        #   wpad-openssl          唯一无线主体 —— 替掉原先 21 个互相冲突的 wpad/hostapd/wpa-supplicant 变体
+        #                         （冲突时哪个生效是随机的，hostapd-basic-* 还天生缺 EAP/Suite-B/WEP）
+        #   kmod-mt7921u          MT7921AU 驱动（固件由 kmod-mt7921-firmware 自动带入）
+        #   wireless-regdb       监管域；hostapd 遇到 country '00' 会直接拒绝起 AP
+        #   usb-modeswitch       Zero-CD（U 盘模式）网卡必需
+        #   xg040g-wifi-defaults  本地包：首启自动关掉 AP 接口、纠正 band/country、补齐 wwan+防火墙
+        #   其余为 OpenClash/PassWall 及其内核模块与 btop
+        default: 'wpad-openssl wireless-regdb iwinfo usb-modeswitch kmod-mt7921u xg040g-wifi-defaults luci-app-openclash ruby ruby-yaml luci-compat unzip bash dnsmasq-full luci-app-passwall xray-core geoview kmod-tun kmod-nft-tproxy kmod-nft-socket kmod-nf-socket kmod-inet-diag kmod-netlink-diag btop hostapd-utils'
         type: string
       pkg_versions:
         description: '⚗️ 实验性 · 指定软件包版本（如 sing-box=1.13.19，跨版本不保证编得过；留空用 config/pkg-versions.txt）'

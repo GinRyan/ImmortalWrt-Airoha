@@ -41,3 +41,25 @@ acl.d:  getVlanOffload  getPPPoEOffload  setVlanOffload  setPPPoEOffload
 包内 `README.md` 是 1.0.1 时代的，`RPC Methods` 一节没有列 VLAN/PPPoE 那几个方法；
 原文里的 `screenshots/` 三张截图（约 3 MB）只是 README 插图、不会装进固件，已删除，
 对应的引用也一并去掉。其余内容保持原样。
+
+## xg040g-wifi-defaults
+
+XG-040G-MD + USB 无线网卡（本机是 MT7921AU）的**无线默认值纠正包**：
+首次启动关掉所有 AP 接口、纠正 `country`/`band`、补齐 `wwan` + `wan zone(masq)` + `lan→wan` 转发。
+
+| | |
+| --- | --- |
+| 来源 | 本仓库自加（基于本机实测，2026-10-09） |
+| 目的 | 刷完即用（STA 无线转有线桥接），**不需要任何刷后 shell** |
+| 引用位置 | workflow 的 `extra_packages` 默认值；以及 `config/xg-040g-md-master.config` |
+
+**为什么需要**（完整实测记录与上游依据见包内 `README.md`）：
+
+- 这块 MT7921AU 是**单 vif 卡**：AP 占住射频后 STA 接口根本不会被创建，而且 AP 启动
+  会在 `set key`（组密钥）处把固件搞崩、USB 随后掉线只能物理重插 → 首启**关掉所有 AP 接口**。
+- `option country '00'` → hostapd 报 `Invalid country_code '00'`，直接拒绝启动。
+- `option band '6g'` → LuCI 判定 `is_6ghz`，加密列表被砍到只剩 WPA3-SAE/OWE。
+- 干净刷机没有 `wwan` 接口、wan zone 也不含它，STA 拿到 IP 也出不了网。
+
+⚠️ 包里的 `UPLINK_SSID` / `UPLINK_ENCRYPTION` / `UPLINK_KEY` **默认留空**：
+本仓库是公开的，**不要把 WiFi 密码提交进来**；要固化请放在自己的私有分支。

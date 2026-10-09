@@ -1,0 +1,157 @@
+#!/bin/sh
+# ============================================================================
+#  /etc/uci-defaults/99-xg040g-wifi   （由 xg040g-wifi-defaults 包安装）
+#  用途：XG-040G-MD + USB 无线网卡，把固件配成 **STA 无线转有线桥接** 开箱可用。
+#  首次启动执行一次，执行后由 uci-defaults 机制自动删除。幂等。
+#
+#  为什么需要它（都是实测踩过的坑，详见 ../README.md）：
+#   1) 这块 USB 卡（MT7921AU）**同时只能有一个 vif**。wifi-detect 首启生成的默认
+#      接口是 AP；AP 一占住射频，STA 接口就永远起不来 —— 而且 AP 启动时会在
+#      "set key" 处把固件搞崩（USB 随后掉线，只能物理重插）。
+#      => 所以本脚本默认【关掉所有 AP 接口】，让 STA 独占。
+#   2) country 为空或 '00'：hostapd/wpa_supplicant 都要求有效监管域，AP 会被直接拒绝。
+#   3) band 被写成 '6g'：本卡固件会误报 6GHz；对 STA 来说波段配对也会出错，
+#      对 AP 来说 LuCI 会把加密列表砍到只剩 WPA3。
+#   4) 干净刷机时没有 wwan 接口、wan zone 也不含它，STA 拿到 IP 也出不了网。
+# ============================================================================
+
+. /lib/functions.sh
+
+# ──────────────────────────── 可调参数 ─────────────────────────────────────
+COUNTRY="CN"              # 空或 '00' 时改成它（写你实际所在国家，影响 5GHz 可用信道）
+DEMOTE_6G="1"             # 1 = 把误配的 band '6g' 降回 5g
+FALLBACK_BAND="5g"
+DISABLE_AP="1"            # 1 = 关掉所有 AP 接口（单 vif 卡必须这样；也是防崩关键）
+WAN_IFACE="wwan"          # 上游接口逻辑名
+SETUP_FIREWALL="1"        # 1 = 自动补齐 wwan 接口 + wan zone(masq) + lan→wan 转发
+
+# 上游 WiFi（留空 = 不动已有 STA 配置、也不新建）
+#   ⚠️ 本仓库是公开的，**不要把 WiFi 密码提交进这个文件**。
+#      想「刷完自动连上游」，在本地改这两行、只提交到自己的私有分支，或者干脆
+#      留空刷完在 LuCI 里连一次（会写进设备的 /etc/config/wireless，不进仓库）。
+UPLINK_SSID=""            # 例如 "MyUpstream"
+UPLINK_ENCRYPTION=""      # psk2 / psk-mixed / sae-mixed / sae / wpa2(wpa2-eap)
+UPLINK_KEY=""
+# ───────────────────────────────────────────────────────────────────────────
+
+[ -f /etc/config/wireless ] || exit 0
+
+# ---------- 1) radio 级：country / band ----------
+fix_dev() {
+	local cfg="$1" band country
+	config_get band    "$cfg" band
+	config_get country "$cfg" country
+
+	if [ -z "$country" ] || [ "$country" = "00" ]; then
+		uci set wireless."$cfg".country="$COUNTRY"
+		echo "xg040g-wifi: $cfg country '$country' -> $COUNTRY"
+	fi
+	if [ "$DEMOTE_6G" = "1" ] && [ "$band" = "6g" ]; then
+		uci set wireless."$cfg".band="$FALLBACK_BAND"
+		echo "xg040g-wifi: $cfg band '6g' -> $FALLBACK_BAND"
+	fi
+}
+
+# ---------- 2) 关掉所有 AP 接口（单 vif 卡的关键） ----------
+disable_ap() {
+	local cfg="$1" mode
+	config_get mode "$cfg" mode
+	if [ "$mode" = "ap" ]; then
+		uci set wireless."$cfg".disabled='1'
+		echo "xg040g-wifi: $cfg (mode=ap) -> disabled（单 vif 卡由 STA 独占）"
+	fi
+}
+
+config_load wireless
+config_foreach fix_dev wifi-device
+[ "$DISABLE_AP" = "1" ] && config_foreach disable_ap wifi-iface
+
+# ---------- 3) 上游 STA ----------
+if [ -n "$UPLINK_SSID" ]; then
+	FIRST_DEV=""
+	get_dev() { [ -z "$FIRST_DEV" ] && FIRST_DEV="$1"; return 0; }
+	config_foreach get_dev wifi-device
+
+	STA_SEC=""
+	get_sta() { local cfg="$1" m; config_get m "$cfg" mode; [ "$m" = "sta" ] && [ -z "$STA_SEC" ] && STA_SEC="$cfg"; return 0; }
+	config_foreach get_sta wifi-iface
+
+	if [ -z "$STA_SEC" ]; then
+		STA_SEC="$(uci add wireless wifi-iface)"
+		[ -n "$STA_SEC" ] || STA_SEC="wifinet1"
+		echo "xg040g-wifi: 新建 STA 接口 $STA_SEC"
+	fi
+
+	[ -n "$FIRST_DEV" ] && uci set wireless."$STA_SEC".device="$FIRST_DEV"
+	uci set wireless."$STA_SEC".mode='sta'
+	uci set wireless."$STA_SEC".network="$WAN_IFACE"
+	uci set wireless."$STA_SEC".ssid="$UPLINK_SSID"
+	[ -n "$UPLINK_ENCRYPTION" ] && uci set wireless."$STA_SEC".encryption="$UPLINK_ENCRYPTION"
+	[ -n "$UPLINK_KEY" ]        && uci set wireless."$STA_SEC".key="$UPLINK_KEY"
+	uci set wireless."$STA_SEC".disabled='0'
+	echo "xg040g-wifi: STA $STA_SEC -> $UPLINK_SSID ($UPLINK_ENCRYPTION)"
+fi
+
+uci commit wireless
+
+# ---------- 4) 上游接口 + 防火墙（干净刷机时才有意义；幂等） ----------
+if [ "$SETUP_FIREWALL" = "1" ]; then
+	# 4.1 network.<WAN_IFACE> = dhcp
+	if ! uci -q get network."$WAN_IFACE" >/dev/null; then
+		uci set network."$WAN_IFACE"=interface
+		uci set network."$WAN_IFACE".proto='dhcp'
+		echo "xg040g-wifi: 新建 network.$WAN_IFACE (proto dhcp)"
+	fi
+
+	# 4.2 找到（或新建）名为 wan 的 zone，确保含 wwan 且开 masq
+	WAN_ZONE=""
+	chk_zone() {
+		local cfg="$1" name
+		config_get name "$cfg" name
+		[ "$name" = "wan" ] && [ -z "$WAN_ZONE" ] && WAN_ZONE="$cfg"
+		return 0
+	}
+	config_load firewall
+	config_foreach chk_zone zone
+
+	if [ -n "$WAN_ZONE" ]; then
+		uci -q get firewall."$WAN_ZONE".masq >/dev/null || uci set firewall."$WAN_ZONE".masq='1'
+		NETS="$(uci -q get firewall."$WAN_ZONE".network)"
+		case " $NETS " in
+			*" $WAN_IFACE "*) : ;;
+			*) uci add_list firewall."$WAN_ZONE".network="$WAN_IFACE"; echo "xg040g-wifi: wan zone += $WAN_IFACE" ;;
+		esac
+	else
+		WAN_ZONE="$(uci add firewall zone)"
+		uci set firewall."$WAN_ZONE".name='wan'
+		uci set firewall."$WAN_ZONE".input='REJECT'
+		uci set firewall."$WAN_ZONE".output='ACCEPT'
+		uci set firewall."$WAN_ZONE".forward='DROP'
+		uci set firewall."$WAN_ZONE".masq='1'
+		uci set firewall."$WAN_ZONE".mtu_fix='1'
+		uci add_list firewall."$WAN_ZONE".network="$WAN_IFACE"
+		echo "xg040g-wifi: 新建 wan zone"
+	fi
+
+	# 4.3 lan -> wan 转发
+	FWD_OK=""
+	chk_fwd() {
+		local cfg="$1" s d
+		config_get s "$cfg" src; config_get d "$cfg" dest
+		[ "$s" = "lan" ] && [ "$d" = "wan" ] && FWD_OK="1"
+		return 0
+	}
+	config_foreach chk_fwd forwarding
+	if [ -z "$FWD_OK" ]; then
+		local_fwd="$(uci add firewall forwarding)"
+		uci set firewall."$local_fwd".src='lan'
+		uci set firewall."$local_fwd".dest='wan'
+		echo "xg040g-wifi: 新建 forwarding lan->wan"
+	fi
+
+	uci commit network
+	uci commit firewall
+fi
+
+echo "xg040g-wifi: 完成（如需立即生效：wifi reload; /etc/init.d/firewall reload）"
+exit 0
