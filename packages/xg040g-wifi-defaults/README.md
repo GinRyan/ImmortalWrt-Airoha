@@ -101,6 +101,66 @@ ping -I 192.168.1.1 1.1.1.1        # 强制用 LAN 网段源地址 → 0% 丢包
 
 ---
 
+### 结论 7 ⭐ `ra_default='1'` 会让 Windows 显示「IPv6：无 Internet 访问」，**尽管 IPv6 完全通**
+
+**症状**：路由器已经拿到 IPv6（有 PD 委派、能 ping 通 IPv6 外网），但 PC 的网络状态里
+IPv6 显示「无 Internet 访问」。
+
+**先证伪**（数据面全通，问题不在连通性）：
+
+```text
+# 本机（Windows，走路由器那块网卡）
+curl -6 http://ipv6.msftconnecttest.com/connecttest.txt   → HTTP 200
+curl -6 --interface <路由器委派前缀地址> https://www.taobao.com → HTTP 200
+ping -6 -S <委派前缀地址> 2400:3200::1                    → 0% loss
+# 路由器自身
+ping -6 -I 2409:8a3c:b51:d714::1 2400:3200::1             → 0% loss（LAN 前缀作源也通）
+```
+
+**真因**：`dhcp.lan.ra_default` 被设成了 `1`。官方 `/etc/config/dhcp` 文档的语义是：
+
+| 值 | 何时才通告默认路由器寿命 |
+| --- | --- |
+| `0`（默认） | 有默认路由 **且** 接口有全局地址 |
+| `1` | 有默认路由 **但** 接口没有全局地址 |
+| `2` | 两者都没有 |
+
+br-lan **有全局地址**（`2409:8a3c:b51:d714::1/62`，来自上游 PD），所以 `1` 的条件不成立，
+odhcpd 把 RA 里的 **router lifetime 设成 0**，并在日志刷：
+
+```text
+daemon.warn odhcpd[2908]: No default route present, setting ra_lifetime to 0!
+```
+
+router lifetime = 0 的意思是"**我（这个路由器）不是默认路由器**"。于是主机即使有地址、
+数据面也通，操作系统仍会把该网卡判成没有 IPv6 Internet。
+
+**修复与验证**：
+
+```sh
+uci set dhcp.lan.ra_default='0'    # 或直接删掉该选项，回到文档默认值
+uci commit dhcp
+/etc/init.d/odhcpd restart
+```
+
+修复后 Windows 自己的判定字段立刻变好：
+
+```text
+InterfaceAlias  IPv4Connectivity  IPv6Connectivity
+Ethernet        Internet          Internet          ← 修复前是「无 Internet 访问」
+```
+
+**顺带发现的两点（不影响使用，了解即可）**：
+
+- `ubus call dhcp ipv6leases` 显示 **br-lan 一个 DHCPv6 租约都没有**；PC 在路由器这块网卡上
+  只有 SLAAC 地址、**没有 IPv6 DNS**（`ra_flags` 里带 `managed-config`，即"地址和 DNS 都去问
+  DHCPv6"，而 DHCPv6 没成）。因为 Windows 还能用 IPv4 的 DNS（192.168.1.1）解析 AAAA，
+  所以功能上无感。若想让 LAN 走"纯 SLAAC + RDNSS"，可把 `dhcp.lan.ra_flags` 设为 `none`
+  （`ra_slaac` 与 `ra_dns` 默认都开）。
+- 如果测试机**同时**直连上游 WiFi（本机 `WLAN 6` 就是），它的 IPv6 默认路由会被 metric 更低的
+  无线网卡抢占（`WLAN 6` metric 10 < `Ethernet` metric 25），`tracert` 第一跳会是上游网关。
+  这会让"到底走没走路由器"变得难以判断 —— 判断时请用 `curl --interface <源地址>` 强制指定源。
+
 ## 二、实测通过的桥接状态
 
 | 项 | 值 |
@@ -126,7 +186,8 @@ ping -I 192.168.1.1 1.1.1.1        # 强制用 LAN 网段源地址 → 0% 丢包
 
    ⚠️ **本仓库是公开的，不要把 WiFi 密码提交进来**；要固化就放在自己的私有分支/私有 fork，
    或者留空、刷完在 LuCI 里连一次（会写进设备的 `/etc/config/wireless`，不进仓库）。
-3. 其余可调项：`COUNTRY`（默认 `CN`）、`DEMOTE_6G`、`DISABLE_AP`、`SETUP_FIREWALL`、`WAN_IFACE`。
+3. 其余可调项：`COUNTRY`（默认 `CN`）、`DEMOTE_6G`、`DISABLE_AP`、`SETUP_FIREWALL`、`WAN_IFACE`、
+   `FIX_IPV6_RA`（默认 `1`：把 `dhcp.lan.ra_default` 钉回 `0`，见结论 7）。
 
 ## 四、刷完自查
 
@@ -148,6 +209,7 @@ ping -I 192.168.1.1 1.1.1.1   # 强制 LAN 源地址验证 NAT
 | AP 起不来 + hostapd 报 `Invalid country_code '00'` | `country '00'` | 设有效国家（本包自动做，默认 `CN`） |
 | 起 AP 就把网卡搞掉线、只能重插 | 单 vif 卡 + AP 路径崩固件 | **别用 AP**，关掉 AP 接口（本包自动做） |
 | STA 拿到 IP 但 LAN 出不了网 | `wwan` 不在 wan zone / 没 masq / 没 forwarding | 本包自动补齐（`SETUP_FIREWALL=1`） |
+| IPv6 有地址但 Windows 显示「无 Internet 访问」 | `dhcp.lan.ra_default='1'` → RA 的 router lifetime=0 | 改回 `0`（本包 `FIX_IPV6_RA=1` 自动做） |
 
 ## 六、上游依据（便于日后核对）
 

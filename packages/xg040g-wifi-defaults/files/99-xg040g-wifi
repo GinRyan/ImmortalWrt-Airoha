@@ -24,6 +24,8 @@ FALLBACK_BAND="5g"
 DISABLE_AP="1"            # 1 = 关掉所有 AP 接口（单 vif 卡必须这样；也是防崩关键）
 WAN_IFACE="wwan"          # 上游接口逻辑名
 SETUP_FIREWALL="1"        # 1 = 自动补齐 wwan 接口 + wan zone(masq) + lan→wan 转发
+FIX_IPV6_RA="1"           # 1 = 把 dhcp.lan.ra_default 钉回 0（否则 RA 不会通告默认路由器，
+                          #     表现为「IPv6 地址有、Windows 却显示无 Internet 访问」）
 
 # 上游 WiFi（留空 = 不动已有 STA 配置、也不新建）
 #   ⚠️ 本仓库是公开的，**不要把 WiFi 密码提交进这个文件**。
@@ -153,5 +155,29 @@ if [ "$SETUP_FIREWALL" = "1" ]; then
 	uci commit firewall
 fi
 
-echo "xg040g-wifi: 完成（如需立即生效：wifi reload; /etc/init.d/firewall reload）"
+# ---------- 5) IPv6：让 RA 真的通告"我是默认路由器" ----------
+# ra_default 的语义（OpenWrt 官方 /etc/config/dhcp 文档）：
+#   0 = 有默认路由【且】接口有全局地址时，才通告默认路由器寿命（默认值）
+#   1 = 有默认路由但【没有】全局地址时才通告
+#   2 = 两者都没有时才通告
+# 本机 br-lan 有全局地址（上游委派前缀），所以 ra_default=1 时条件不成立 → odhcpd 会把
+# RA 里的路由器寿命设成 0，并在日志刷：
+#   odhcpd: No default route present, setting ra_lifetime to 0!
+# 等于告诉主机"我不是默认路由器"。结果是：IPv6 数据面完全通（ping/HTTP 都正常），
+# 但 Windows 会把该网卡判成「IPv6：无 Internet 访问」。实测把 ra_default 改回 0 后，
+# Get-NetConnectionProfile 的 IPv6Connectivity 立刻变成 Internet。
+# 注意：本脚本只在首次启动跑一次；如果之后用 LuCI「恢复配置」把旧备份灌回来，
+#       ra_default=1 会跟着回来，需要再改一次。
+if [ "$FIX_IPV6_RA" = "1" ]; then
+	if uci -q get dhcp.lan >/dev/null; then
+		CUR_RA_DEFAULT="$(uci -q get dhcp.lan.ra_default)"
+		if [ "$CUR_RA_DEFAULT" != "0" ]; then
+			uci set dhcp.lan.ra_default='0'
+			uci commit dhcp
+			echo "xg040g-wifi: dhcp.lan.ra_default '${CUR_RA_DEFAULT:-未设置}' -> 0（让 RA 通告默认路由器）"
+		fi
+	fi
+fi
+
+echo "xg040g-wifi: 完成（如需立即生效：wifi reload; /etc/init.d/firewall reload; /etc/init.d/odhcpd restart）"
 exit 0
